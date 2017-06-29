@@ -1,0 +1,3 @@
+[submodule "oasisgrids"]
+	path = oasisgrids
+	url = git@github.com:DoublePrecision/oasis-grids.git
