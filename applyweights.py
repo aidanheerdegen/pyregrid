@@ -6,36 +6,17 @@ import subprocess as sp
 import numpy as np
 import numba
 import netCDF4 as nc
-# from scipy import ndimage as nd
 
 ROOT=os.path.dirname(os.path.abspath(__file__))
 sys.path.append(ROOT)
 sys.path.append(os.path.join(ROOT,'oasisgrids','esmgrids'))
 
 from esmgrids.mom_grid import MomGrid
-from esmgrids.jra55_grid import Jra55Grid
-
 from helpers import setup_test_input_dir, setup_test_output_dir
 from helpers import calc_regridding_err
 
 EARTH_RADIUS = 6370997.0
 EARTH_AREA = 4*np.pi*EARTH_RADIUS**2
-
-## def fill_mask_with_nearest_neighbour(field, field_mask):
-##     """
-##     This is the Python way using grid-box nearest neighbour, an alternative is
-##     to do nn based on geographic distance using the above.
-##     """
-
-##     new_data = np.ma.copy(field)
-
-##     ind = nd.distance_transform_edt(field_mask,
-##                                     return_distances=False,
-##                                     return_indices=True)
-##     new_data[:, :] = new_data[tuple(ind)]
-
-##     return new_data
-
 
 def col_idx_largest_lat(lats):
     """
@@ -47,10 +28,17 @@ def col_idx_largest_lat(lats):
 
 def create_mom_output(ocean_grid, filename, time_units, history=""):
 
+    g = nc.Dataset(ocean_grid, 'r')
+
+    x_t = g.variables['geolon_t'][:]
+    y_t = g.variables['geolat_t'][:]
+
+    g.close()
+
     f = nc.Dataset(filename, 'w')
 
-    f.createDimension('xt_ocean', ocean_grid.num_lon_points)
-    f.createDimension('yt_ocean', ocean_grid.num_lat_points)
+    f.createDimension('xt_ocean', x_t.shape[1])
+    f.createDimension('yt_ocean', x_t.shape[0])
     f.createDimension('time')
 
     lons = f.createVariable('xt_ocean', 'f8', ('xt_ocean'))
@@ -60,7 +48,8 @@ def create_mom_output(ocean_grid, filename, time_units, history=""):
     lons.point_spacing = 'even'
     lons.axis = 'X'
     # MOM needs this to be a single dimension
-    lons[:] = ocean_grid.x_t[ocean_grid.x_t.shape[0] // 2, :]
+    print(lons.shape,x_t.shape,x_t[x_t.shape[0] // 2, :].shape)
+    lons[:] = x_t[x_t.shape[0] // 2, :]
 
     lats = f.createVariable('yt_ocean', 'f8', ('yt_ocean'))
     lats.long_name = 'Nominal Latitude of T-cell center'
@@ -68,8 +57,8 @@ def create_mom_output(ocean_grid, filename, time_units, history=""):
     lats.point_spacing = 'uneven'
     lats.axis = 'Y'
     # MOM needs this to be a single dimension
-    col = col_idx_largest_lat(ocean_grid.y_t[:])
-    lats[:] = ocean_grid.y_t[:, col]
+    col = col_idx_largest_lat(y_t[:])
+    lats[:] = y_t[:, col]
 
     time = f.createVariable('time', 'f8', ('time'))
     time.long_name = 'time'
@@ -81,6 +70,8 @@ def create_mom_output(ocean_grid, filename, time_units, history=""):
     time.modulo = " "
 
     f.close()
+
+    return x_t.shape
 
 def write_mom_output(filename, var_name, var_longname, var_units,
                              var_data, time_idx, time_pt, write_ic=False):
@@ -139,44 +130,23 @@ def remap(src_data, weights, dest_shape):
 
     return dest_data
 
-def remap_to_mom(input_file, mom_hgrid, mom_mask, output_file, method='conserve', varname='runoff', verbose=False, clobber=False):
+def remap_to_mom(input_file, mom_hgrid, output_file, weights_file, method='conserve', varname='runoff', verbose=False, clobber=False):
     """
-    Remapping JRA and check that it is conservative.
-
-    It will be necessary to use a destination mask. We want to move all
-    points from src into unmasked parts of the destination.
+    Remapping and check that it is conservative.
     """
 
     if verbose: print("Opening input file: {}".format(input_file))
-
-    cmd = [os.path.join(ROOT, 'oasisgrids', 'remapweights.py')]
-
-    # input_grid = Jra55Grid(input_file)
 
     output_dir = os.path.dirname(output_file)
 
     if verbose: print("Output directory: {}".format(output_dir))
 
-    weights = os.path.join(output_dir, 'WOA_MOM_conserve.nc')
+    weights = os.path.join(output_dir, weights_file)
 
     if not os.path.exists(weights):
 
-        args = ['WOA', 'MOM', '--src_grid', input_file,
-                '--dest_grid', mom_hgrid,
-                '--method', method, '--output', weights]
+        print("Weights file does not exist: {}".format(weights))
     
-        if mom_mask is not None: args.extend(['--dest_mask', mom_mask])
-
-        if verbose: print("Generating weights file : {} using\n{}".format(weights," ".join(cmd + args)))
-    
-        ret = sp.call(cmd + args)
-        assert ret == 0
-        assert os.path.exists(weights)
-
-    
-    # Only use these to pull out the dimensions of the grids.
-    mom = MomGrid.fromfile(mom_hgrid, mask_file=mom_mask)
-
     with nc.Dataset(input_file) as f:
 
         var = f.variables[varname]
@@ -188,17 +158,20 @@ def remap_to_mom(input_file, mom_hgrid, mom_mask, output_file, method='conserve'
             time = numpy.arange(0,var.shape[0])
             time_units = "days since 1900-01-01"
     
-        create_mom_output(mom, output_file, time_units)
+        (ny, nx) = create_mom_output(mom_hgrid, output_file, time_units)
+
+        print(nx,ny)
 
         for idx in range(var.shape[0]):
 
             src = var[idx, :]
 
             if verbose: print("Remapping using weights for index: {}".format(idx))
-            dest = remap(src, weights, (mom.num_lat_points, mom.num_lon_points))
+            dest = remap(src, weights, (ny,nx))
 
-            rel_err = calc_regridding_err(weights, src, dest)
-            print('ESMF relative error {}'.format(rel_err))
+            # Cannot calculate error as there are no valid area values in weights file
+            # rel_err = calc_regridding_err(weights, src, dest)
+            # print('ESMF relative error {}'.format(rel_err))
 
             write_mom_output(output_file, varname, var.long_name, var.units, dest, idx, time[idx])
 
@@ -209,42 +182,42 @@ if __name__ == "__main__":
     parser.add_argument("-o","--output_dir", help="Specify an output directory to save regridded files", default=os.getcwd())
     parser.add_argument("-v","--verbose", help="Verbose output", action='store_true')
     parser.add_argument("-va","--varname", help="Variable name of field to regrid")
-    parser.add_argument("-m","--mask", help="Mask file to apply")
+    parser.add_argument("-w","--weights", help="Weights file to apply")
+    parser.add_argument("-t","--template", help="MOM template file with grid information", default='ocean_grid.nc')
     parser.add_argument("-f","--force", help="Force writing of output file even if it already exists (default is no)", action='store_true')
-    parser.add_argument("inputs", help="JRA files", nargs='+')
+    parser.add_argument("inputs", help="files to regrid", nargs='+')
     args = parser.parse_args()
 
     verbose=args.verbose
 
+    suffix = '.nc'
+
+
+    mom_hgrid = os.path.join(args.input_dir, 'ocean_grid.nc')
+
+    if args.weights is None:
+        weights_file = 'weights.nc'
+    else:
+        weights_file = args.weights
+
+    if verbose: print("MOM hgrid file: {}".format(mom_hgrid))
+
     # Loop over all the inputs from the command line. 
-    for sssinput in args.inputs:
+    for input in args.inputs:
 
-        if verbose: print("Processing {}".format(sssinput))
+        if verbose: print("Processing {}".format(input))
 
-        suffix = '.nc'
-
-        mom_output = os.path.join(args.output_dir,os.path.basename(sssinput))
+        mom_output = os.path.join(args.output_dir,os.path.basename(input))
 
         if mom_output.endswith(suffix):
             mom_output = mom_output[:-len(suffix)] + '_mom.nc'
         else:
             mom_output = mom_output + '_mom.nc'
 
-        if not os.path.isabs(sssinput):
-            sssinput = os.path.join(args.input_dir,sssinput)
+        if not os.path.isabs(input):
+            input = os.path.join(args.input_dir,input)
 
-        mom_hgrid = os.path.join(args.input_dir, 'ocean_hgrid.nc')
+        if verbose: print("MOM output file: {}".format(mom_output))
 
-        if args.mask is not None:
-            mom_mask = os.path.join(args.input_dir, args.mask)
-        else:
-            mom_mask = None
-
-        if verbose:
-            print("Input file: {}".format(sssinput))
-            print("MOM hgrid file: {}".format(mom_hgrid))
-            print("MOM mask file: {}".format(mom_mask))
-            print("MOM output file: {}".format(mom_output))
-
-        remap_to_mom(sssinput, mom_hgrid, mom_mask, mom_output, method='conserve', varname=args.varname, verbose=args.verbose, clobber=args.force)
+        remap_to_mom(input, mom_hgrid, mom_output, method='conserve', weights_file = weights_file, varname=args.varname, verbose=args.verbose, clobber=args.force)
 
